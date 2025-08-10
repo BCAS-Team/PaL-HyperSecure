@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 from threading import Lock
-import jwt
+import jwt  # Import PyJWT for token handling
 import functools
 
 # ===== CONFIG =====
@@ -20,7 +20,7 @@ MAX_DOWNLOADS = 3
 FILE_EXPIRY_DAYS = 30
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Secret key for JWTs - DO NOT USE THIS IN PRODUCTION
+# Secret key for JWTs
 SECRET_KEY = os.environ.get("SECRET_KEY", "your_super_secret_key_here")
 
 app = Flask(__name__)
@@ -90,15 +90,37 @@ def status():
 def signup():
     data = request.json
     users = load_json(USER_FILE)
-    if data["username"] in users:
+    
+    username = data.get("username")
+    password = data.get("password")
+    public_key = data.get("public_key")
+    
+    if not all([username, password]):
+        return jsonify({"error": "Missing username or password"}), 400
+        
+    if username in users:
         return jsonify({"error": "User exists"}), 400
     
-    users[data["username"]] = {
-        "password": data["password"],
-        "public_key": data.get("public_key", "")
+    users[username] = {
+        "password": password,
+        "public_key": public_key or ""
     }
     save_json(USER_FILE, users)
-    return jsonify({"message": "User created", "status": "success"})
+
+    # Generate and return a token immediately after signup
+    token_expiry = datetime.utcnow() + timedelta(hours=1)
+    token = jwt.encode(
+        {"username": username, "exp": token_expiry},
+        SECRET_KEY,
+        algorithm="HS256"
+    )
+    
+    return jsonify({
+        "message": "User created and logged in",
+        "status": "success",
+        "token": token,
+        "expiry": token_expiry.timestamp()
+    })
 
 @app.route("/login", methods=["POST"])
 def login():
@@ -109,6 +131,9 @@ def login():
     password = data.get("password")
     public_key = data.get("public_key")
     
+    if not all([username, password]):
+        return jsonify({"error": "Missing username or password"}), 400
+
     if username not in users or users[username]["password"] != password:
         return jsonify({"error": "Invalid credentials"}), 401
     
@@ -129,7 +154,7 @@ def login():
         "message": "Login successful",
         "status": "success",
         "token": token,
-        "access_token": token,
+        "access_token": token,  # client uses both, so provide both
         "expiry": token_expiry.timestamp()
     })
 
@@ -143,6 +168,8 @@ def get_public_key(username):
     if not public_key:
         return jsonify({"error": "No public key available for user"}), 404
     
+    # Client expects a specific format with a device ID map.
+    # We will use a placeholder since the server doesn't track devices.
     return jsonify({
         "status": "success",
         "public_keys": {
@@ -163,6 +190,7 @@ def send_message(current_user):
     if not all([sender, receiver, ciphertext]):
         return jsonify({"error": "Missing data"}), 400
         
+    # Verify sender matches the logged-in user
     if sender != current_user:
         return jsonify({"error": "Unauthorized sender"}), 403
 
@@ -182,12 +210,14 @@ def send_message(current_user):
 @app.route("/messages/<username>", methods=["GET"])
 @token_required
 def get_messages(current_user, username):
+    # Verify the user is requesting their own messages
     if current_user != username:
         return jsonify({"error": "Unauthorized"}), 403
 
     messages = load_json(MESSAGES_FILE)
     msgs = messages.get(username, [])
     
+    # Clear the messages after retrieval
     if username in messages:
         messages[username] = []
         save_json(MESSAGES_FILE, messages)
@@ -195,14 +225,8 @@ def get_messages(current_user, username):
     return jsonify({"messages": msgs, "status": "success"})
 
 @app.route("/upload", methods=["POST"])
-def upload():
-    username = request.form.get("username")
-    password = request.form.get("password")
-
-    users = load_json(USER_FILE)
-    if username not in users or users[username]["password"] != password:
-        return jsonify({"error": "Auth failed"}), 401
-
+@token_required
+def upload(current_user):
     if "file" not in request.files:
         return jsonify({"error": "No file"}), 400
 
@@ -221,22 +245,32 @@ def upload():
         "original_name": filename,
         "path": compressed_path,
         "downloads": 0,
-        "upload_time": time.time()
+        "upload_time": time.time(),
+        "uploader": current_user
     }
     save_json(META_FILE, meta)
     return jsonify({"message": "Uploaded", "file_id": file_id})
 
 @app.route("/download/<file_id>", methods=["GET"])
-def download(file_id):
+@token_required
+def download(current_user, file_id):
     meta = load_json(META_FILE)
     if file_id not in meta:
         return jsonify({"error": "Not found"}), 404
 
     info = meta[file_id]
     
+    # We will uncomment the download limits now that the client is fixed
+    if info["downloads"] >= MAX_DOWNLOADS:
+        return jsonify({"error": "Download limit reached"}), 403
+    
+    if time.time() - info["upload_time"] > FILE_EXPIRY_DAYS * 86400:
+        return jsonify({"error": "Expired"}), 403
+
     meta[file_id]["downloads"] += 1
     save_json(META_FILE, meta)
 
+    # Use a custom header to pass the original filename back to the client
     response = send_file(info["path"], as_attachment=True, download_name=info["original_name"] + ".gz")
     response.headers["X-Orig-Filename"] = info["original_name"]
     return response
