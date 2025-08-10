@@ -55,5 +55,4 @@ def login():
         return jsonify({"status": "error", "message": "Invalid username or password"}), 400
 
 if __name__ == "__main__":
-    # Listen on all interfaces, port 5000 (Render defaults)
     app.run(host="0.0.0.0", port=5000)
