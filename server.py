@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 import bcrypt
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import threading
 import time
 
@@ -24,7 +24,7 @@ def save_json(filename, data):
         json.dump(data, f)
 
 def log_user_creation(username, ip):
-    timestamp = datetime.utcnow().isoformat() + "Z"
+    timestamp = datetime.now(timezone.utc).isoformat()
     print(f"[{timestamp}] User created: '{username}' from IP: {ip}")
 
 def background_stats():
@@ -34,8 +34,16 @@ def background_stats():
             users_count = len(active_users)
         messages = load_json(MESSAGES_FILE)
         tasks_count = sum(len(msgs) for msgs in messages.values()) if messages else 0
-        timestamp = datetime.utcnow().isoformat() + "Z"
+        timestamp = datetime.now(timezone.utc).isoformat()
         print(f"[{timestamp}] Active users: {users_count} | Total messages stored: {tasks_count}")
+
+@app.route("/")
+def index():
+    return "PaL-HyperSecure Server is running.", 200
+
+@app.route("/ping")
+def ping():
+    return "pong", 200
 
 @app.route("/signup", methods=["POST"])
 def signup():
@@ -108,7 +116,7 @@ def send_message():
     sender = data.get("sender")
     receiver = data.get("receiver")
     ciphertext = data.get("ciphertext")
-    timestamp = datetime.utcnow().isoformat() + "Z"
+    timestamp = datetime.now(timezone.utc).isoformat()
 
     if not sender or not receiver or not ciphertext:
         return jsonify({"status": "error", "message": "sender, receiver, and ciphertext required"}), 400
