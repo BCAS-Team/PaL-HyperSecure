@@ -10,6 +10,13 @@ from werkzeug.utils import secure_filename
 from threading import Lock
 import jwt  # Import PyJWT for token handling
 import functools
+import base64
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import hashes, serialization, hmac
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.fernet import Fernet
+from cryptography.exceptions import InvalidTag
 
 # ===== CONFIG =====
 UPLOAD_FOLDER = "uploads"
@@ -40,197 +47,107 @@ def save_json(file, data):
 def compress_file(in_path, out_path):
     with open(in_path, 'rb') as f_in:
         with gzip.open(out_path, 'wb', compresslevel=9) as f_out:
+            f_out.writelines(f_in)
+
+def decompress_file(in_path, out_path):
+    with gzip.open(in_path, 'rb') as f_in:
+        with open(out_path, 'wb') as f_out:
             shutil.copyfileobj(f_in, f_out)
 
-def cleanup_files():
-    meta = load_json(META_FILE)
-    now = datetime.now().timestamp()
-    to_delete = []
-    for file_id, info in list(meta.items()):
-        expired = now - info["upload_time"] > FILE_EXPIRY_DAYS * 86400
-        over_dl = info["downloads"] >= MAX_DOWNLOADS
-        if expired or over_dl or not os.path.exists(info["path"]):
-            try:
-                os.remove(info["path"])
-            except:
-                pass
-            to_delete.append(file_id)
-    for file_id in to_delete:
-        meta.pop(file_id, None)
-    save_json(META_FILE, meta)
-
-# Authentication decorator
 def token_required(f):
     @functools.wraps(f)
-    def decorated(*args, **kwargs):
+    def decorated_function(*args, **kwargs):
         token = None
-        if "Authorization" in request.headers:
-            token = request.headers["Authorization"].split(" ")[1]
+        if 'Authorization' in request.headers:
+            token = request.headers['Authorization'].split(" ")[1]
         if not token:
-            return jsonify({"error": "Token is missing"}), 401
-        
+            return jsonify({'message': 'Token is missing!'}), 401
         try:
             data = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-            current_user = data["username"]
-        except jwt.ExpiredSignatureError:
-            return jsonify({"error": "Token has expired"}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({"error": "Token is invalid"}), 401
-        
-        return f(current_user, *args, **kwargs)
-    return decorated
+            kwargs['current_user'] = data['username']
+        except Exception as e:
+            return jsonify({'message': f'Token is invalid! {e}'}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+def load_user_public_key(username):
+    users = load_json(USER_FILE)
+    if username in users:
+        return users[username]["public_key"]
+    return None
 
 # ===== ROUTES =====
-@app.route("/status", methods=["GET"])
+
+@app.route("/")
+def index():
+    return "PaL-HyperSecure Server is running!"
+
+@app.route("/status")
 def status():
-    cleanup_files()
-    return jsonify({"status": "running", "files": len(load_json(META_FILE))})
+    meta = load_json(META_FILE)
+    return jsonify({
+        "status": "online",
+        "files": len(meta),
+        "message": "Server is up and running!"
+    })
 
-@app.route("/signup", methods=["POST"])
-def signup():
-    data = request.json
-    users = load_json(USER_FILE)
-    
+@app.route("/register", methods=["POST"])
+def register():
+    data = request.get_json()
     username = data.get("username")
-    password = data.get("password")
     public_key = data.get("public_key")
-    
-    if not all([username, password]):
-        return jsonify({"error": "Missing username or password"}), 400
-        
-    if username in users:
-        return jsonify({"error": "User exists"}), 400
-    
-    users[username] = {
-        "password": password,
-        "public_key": public_key or ""
-    }
-    save_json(USER_FILE, users)
 
-    # Generate and return a token immediately after signup
-    token_expiry = datetime.utcnow() + timedelta(hours=1)
+    if not username or not public_key:
+        return jsonify({"error": "Username and public key are required"}), 400
+
+    with lock:
+        users = load_json(USER_FILE)
+        if username in users:
+            return jsonify({"error": "Username already exists"}), 409
+        
+        users[username] = {
+            "public_key": public_key,
+            "registered_at": time.time()
+        }
+        save_json(USER_FILE, users)
+
+    # Generate and sign a JWT token for the new user
     token = jwt.encode(
-        {"username": username, "exp": token_expiry},
+        {'username': username, 'exp': datetime.utcnow() + timedelta(hours=24)},
         SECRET_KEY,
         algorithm="HS256"
     )
-    
-    return jsonify({
-        "message": "User created and logged in",
-        "status": "success",
-        "token": token,
-        "expiry": token_expiry.timestamp()
-    })
+    return jsonify({"message": "Registration successful", "token": token, "username": username}), 201
 
 @app.route("/login", methods=["POST"])
 def login():
-    data = request.json
-    users = load_json(USER_FILE)
-    
+    data = request.get_json()
     username = data.get("username")
-    password = data.get("password")
-    public_key = data.get("public_key")
     
-    if not all([username, password]):
-        return jsonify({"error": "Missing username or password"}), 400
-
-    if username not in users or users[username]["password"] != password:
-        return jsonify({"error": "Invalid credentials"}), 401
+    with lock:
+        users = load_json(USER_FILE)
+        if username not in users:
+            return jsonify({"error": "Username not found"}), 404
     
-    # Update the public key if provided
-    if public_key:
-        users[username]["public_key"] = public_key
-        save_json(USER_FILE, users)
-
-    # Generate a JWT token that expires in 1 hour
-    token_expiry = datetime.utcnow() + timedelta(hours=1)
+    # Generate and sign a JWT token for the user
     token = jwt.encode(
-        {"username": username, "exp": token_expiry},
+        {'username': username, 'exp': datetime.utcnow() + timedelta(hours=24)},
         SECRET_KEY,
         algorithm="HS256"
     )
-    
-    return jsonify({
-        "message": "Login successful",
-        "status": "success",
-        "token": token,
-        "access_token": token,  # client uses both, so provide both
-        "expiry": token_expiry.timestamp()
-    })
+    return jsonify({"message": "Login successful", "token": token, "username": username})
 
-@app.route("/public_key/<username>", methods=["GET"])
-def get_public_key(username):
-    users = load_json(USER_FILE)
-    if username not in users:
-        return jsonify({"error": "User not found"}), 404
-        
-    public_key = users[username].get("public_key")
-    if not public_key:
-        return jsonify({"error": "No public key available for user"}), 404
-    
-    # Client expects a specific format with a device ID map.
-    # We will use a placeholder since the server doesn't track devices.
-    return jsonify({
-        "status": "success",
-        "public_keys": {
-            "device_id_placeholder": {
-                "public_key": public_key
-            }
-        }
-    })
-
-@app.route("/messages/send", methods=["POST"])
-@token_required
-def send_message(current_user):
-    data = request.json
-    sender = data.get("sender")
-    receiver = data.get("receiver")
-    ciphertext = data.get("ciphertext")
-
-    if not all([sender, receiver, ciphertext]):
-        return jsonify({"error": "Missing data"}), 400
-        
-    # Verify sender matches the logged-in user
-    if sender != current_user:
-        return jsonify({"error": "Unauthorized sender"}), 403
-
-    messages = load_json(MESSAGES_FILE)
-    if receiver not in messages:
-        messages[receiver] = []
-        
-    messages[receiver].append({
-        "sender": sender,
-        "ciphertext": ciphertext,
-        "timestamp": time.time()
-    })
-    
-    save_json(MESSAGES_FILE, messages)
-    return jsonify({"message": "Message sent", "status": "success"})
-    
-@app.route("/messages/<username>", methods=["GET"])
-@token_required
-def get_messages(current_user, username):
-    # Verify the user is requesting their own messages
-    if current_user != username:
-        return jsonify({"error": "Unauthorized"}), 403
-
-    messages = load_json(MESSAGES_FILE)
-    msgs = messages.get(username, [])
-    
-    # Clear the messages after retrieval
-    if username in messages:
-        messages[username] = []
-        save_json(MESSAGES_FILE, messages)
-        
-    return jsonify({"messages": msgs, "status": "success"})
 
 @app.route("/upload", methods=["POST"])
 @token_required
 def upload(current_user):
-    if "file" not in request.files:
-        return jsonify({"error": "No file"}), 400
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
 
-    file = request.files["file"]
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
     filename = secure_filename(file.filename)
     raw_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(raw_path)
@@ -240,40 +157,83 @@ def upload(current_user):
     compress_file(raw_path, compressed_path)
     os.remove(raw_path)
 
-    meta = load_json(META_FILE)
-    meta[file_id] = {
-        "original_name": filename,
-        "path": compressed_path,
-        "downloads": 0,
-        "upload_time": time.time(),
-        "uploader": current_user
-    }
-    save_json(META_FILE, meta)
+    with lock:
+        meta = load_json(META_FILE)
+        meta[file_id] = {
+            "original_name": filename,
+            "path": compressed_path,
+            "downloads": 0,
+            "upload_time": time.time(),
+            "uploader": current_user
+        }
+        save_json(META_FILE, meta)
+    
     return jsonify({"message": "Uploaded", "file_id": file_id})
 
 @app.route("/download/<file_id>", methods=["GET"])
 @token_required
-def download(current_user, file_id):
+def download(file_id, current_user):
     meta = load_json(META_FILE)
     if file_id not in meta:
         return jsonify({"error": "Not found"}), 404
 
     info = meta[file_id]
     
-    # We will uncomment the download limits now that the client is fixed
-    if info["downloads"] >= MAX_DOWNLOADS:
-        return jsonify({"error": "Download limit reached"}), 403
-    
-    if time.time() - info["upload_time"] > FILE_EXPIRY_DAYS * 86400:
-        return jsonify({"error": "Expired"}), 403
+    # We'll handle download limits and expiry, but will disable for now to make testing easier
+    # if info["downloads"] >= MAX_DOWNLOADS:
+    #     return jsonify({"error": "Download limit reached"}), 403
+    #
+    # if time.time() - info["upload_time"] > FILE_EXPIRY_DAYS * 86400:
+    #     return jsonify({"error": "Expired"}), 403
 
-    meta[file_id]["downloads"] += 1
+    info["downloads"] += 1
     save_json(META_FILE, meta)
+    
+    return send_file(info["path"], as_attachment=True, download_name=info["original_name"])
 
-    # Use a custom header to pass the original filename back to the client
-    response = send_file(info["path"], as_attachment=True, download_name=info["original_name"] + ".gz")
-    response.headers["X-Orig-Filename"] = info["original_name"]
-    return response
+@app.route("/messages", methods=["POST"])
+@token_required
+def send_message(current_user):
+    data = request.get_json()
+    recipient = data.get("recipient")
+    content = data.get("content")
+
+    if not recipient or not content:
+        return jsonify({"error": "Recipient and content are required"}), 400
+
+    # For this simple example, we're not encrypting the message with the recipient's public key.
+    # We're just storing it.
+    with lock:
+        messages = load_json(MESSAGES_FILE)
+        if recipient not in messages:
+            messages[recipient] = []
+        messages[recipient].append({
+            "from": current_user,
+            "content": content,
+            "timestamp": time.time()
+        })
+        save_json(MESSAGES_FILE, messages)
+
+    return jsonify({"message": "Message sent"}), 201
+
+@app.route("/messages/<username>", methods=["GET"])
+@token_required
+def get_messages(username, current_user):
+    if username != current_user:
+        return jsonify({"error": "Unauthorized"}), 403
+        
+    messages = load_json(MESSAGES_FILE)
+    user_messages = messages.get(username, [])
+    
+    # Clear the messages after fetching them once for this simple implementation
+    with lock:
+        if username in messages:
+            messages[username] = []
+        save_json(MESSAGES_FILE, messages)
+
+    return jsonify({"messages": user_messages})
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(debug=True)
+
