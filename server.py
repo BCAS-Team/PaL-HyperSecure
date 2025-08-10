@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 from threading import Lock
-import jwt  # Import PyJWT for token handling
+import jwt
 import functools
 
 # ===== CONFIG =====
@@ -20,7 +20,7 @@ MAX_DOWNLOADS = 3
 FILE_EXPIRY_DAYS = 30
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Secret key for JWTs
+# Secret key for JWTs - DO NOT USE THIS IN PRODUCTION
 SECRET_KEY = os.environ.get("SECRET_KEY", "your_super_secret_key_here")
 
 app = Flask(__name__)
@@ -129,7 +129,7 @@ def login():
         "message": "Login successful",
         "status": "success",
         "token": token,
-        "access_token": token,  # client uses both, so provide both
+        "access_token": token,
         "expiry": token_expiry.timestamp()
     })
 
@@ -143,11 +143,10 @@ def get_public_key(username):
     if not public_key:
         return jsonify({"error": "No public key available for user"}), 404
     
-    # Client expects a specific format
     return jsonify({
         "status": "success",
         "public_keys": {
-            "device_id_placeholder": {  # Client expects a device_id map
+            "device_id_placeholder": {
                 "public_key": public_key
             }
         }
@@ -164,7 +163,6 @@ def send_message(current_user):
     if not all([sender, receiver, ciphertext]):
         return jsonify({"error": "Missing data"}), 400
         
-    # Verify sender matches the logged-in user
     if sender != current_user:
         return jsonify({"error": "Unauthorized sender"}), 403
 
@@ -184,14 +182,12 @@ def send_message(current_user):
 @app.route("/messages/<username>", methods=["GET"])
 @token_required
 def get_messages(current_user, username):
-    # Verify the user is requesting their own messages
     if current_user != username:
         return jsonify({"error": "Unauthorized"}), 403
 
     messages = load_json(MESSAGES_FILE)
     msgs = messages.get(username, [])
     
-    # Clear the messages after retrieval
     if username in messages:
         messages[username] = []
         save_json(MESSAGES_FILE, messages)
@@ -238,17 +234,9 @@ def download(file_id):
 
     info = meta[file_id]
     
-    # We'll handle download limits and expiry, but will disable for now to make testing easier
-    # if info["downloads"] >= MAX_DOWNLOADS:
-    #     return jsonify({"error": "Download limit reached"}), 403
-    #
-    # if time.time() - info["upload_time"] > FILE_EXPIRY_DAYS * 86400:
-    #     return jsonify({"error": "Expired"}), 403
-
     meta[file_id]["downloads"] += 1
     save_json(META_FILE, meta)
 
-    # Use a custom header to pass the original filename back to the client
     response = send_file(info["path"], as_attachment=True, download_name=info["original_name"] + ".gz")
     response.headers["X-Orig-Filename"] = info["original_name"]
     return response
