@@ -12,6 +12,7 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 
 # Database Configuration for Railway
+# Use a default URL for local development if the environment variable isn't set.
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@localhost/paL_hypersecure")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -41,6 +42,7 @@ class Message(Base):
     sender = relationship("User", foreign_keys=[sender_id], back_populates="sent_messages")
     recipient = relationship("User", foreign_keys=[recipient_id], back_populates="received_messages")
 
+# Enum to define friendship status
 class FriendshipStatus(str, Enum):
     PENDING = "pending"
     ACCEPTED = "accepted"
@@ -50,7 +52,12 @@ class Friendship(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     friend_id = Column(Integer, ForeignKey("users.id"))
-    status = Column(Enum(FriendshipStatus), default=FriendshipStatus.PENDING)
+    
+    # FIX: The original code passed the Enum class to Column(Enum), which caused a TypeError.
+    # We must pass the string values directly to define the valid options.
+    # The 'name' argument is optional but good practice for clarity in the database.
+    status = Column(Enum("pending", "accepted", name="friendship_status"), default="pending")
+    
     created_at = Column(DateTime, default=datetime.utcnow)
 
     # Relationships to enable easy access to user and friend details
