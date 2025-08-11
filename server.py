@@ -1,18 +1,18 @@
 import os
 import uuid
+import gzip
+import shutil
 import json
 import time
 import logging
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
-from threading import Lock, Thread
+from flask import Flask, request, jsonify, send_file
+from werkzeug.utils import secure_filename
+from threading import Lock
 import jwt
 import functools
 import hashlib
 from pathlib import Path
-import sqlite3
-from contextlib import contextmanager
-import schedule
 
 # ===== LOGGING SETUP =====
 logging.basicConfig(
@@ -26,14 +26,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ===== CONFIG =====
+UPLOAD_FOLDER = Path("uploads")
 DATA_FOLDER = Path("data")
+UPLOAD_FOLDER.mkdir(exist_ok=True)
 DATA_FOLDER.mkdir(exist_ok=True)
 
-DB_FILE = DATA_FOLDER / "messaging.db"
-MESSAGE_RETENTION_DAYS = 30
-MAX_MESSAGE_LENGTH = 5000
-MAX_USERNAME_LENGTH = 50
-MIN_USERNAME_LENGTH = 3
+META_FILE = DATA_FOLDER / "file_meta.json"
+USER_FILE = DATA_FOLDER / "users.json"
+MESSAGES_FILE = DATA_FOLDER / "messages.json"
+
+MAX_DOWNLOADS = 3
+FILE_EXPIRY_DAYS = 30
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+ALLOWED_EXTENSIONS = {
+    'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'doc', 'docx', 
+    'xls', 'xlsx', 'zip', 'rar', '7z', 'mp3', 'mp4', 'avi'
+}
 
 # Secret key for JWTs - MUST be set in production
 SECRET_KEY = os.environ.get("SECRET_KEY")
@@ -42,61 +50,74 @@ if not SECRET_KEY:
     logger.warning("Using generated SECRET_KEY. Set SECRET_KEY environment variable in production!")
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 lock = Lock()
 
-# ===== DATABASE SETUP =====
-def init_database():
-    """Initialize SQLite database with proper schema."""
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL COLLATE NOCASE,
-                public_key TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_login TIMESTAMP,
-                is_active BOOLEAN DEFAULT 1
-            );
-            
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                from_user TEXT NOT NULL,
-                to_user TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_read BOOLEAN DEFAULT 0,
-                message_uuid TEXT UNIQUE NOT NULL,
-                FOREIGN KEY (from_user) REFERENCES users (username),
-                FOREIGN KEY (to_user) REFERENCES users (username)
-            );
-            
-            CREATE INDEX IF NOT EXISTS idx_messages_to_user ON messages(to_user, is_read);
-            CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
-            CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-        """)
-        conn.commit()
-    logger.info("Database initialized successfully")
-
-@contextmanager
-def get_db_connection():
-    """Context manager for database connections."""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
-
 # ===== HELPERS =====
+def load_json(file_path):
+    """Load JSON file with error handling."""
+    try:
+        if not file_path.exists():
+            return {}
+        with open(file_path, "r", encoding='utf-8') as f:
+            data = json.load(f)
+            return data if data else {}
+    except (json.JSONDecodeError, IOError) as e:
+        logger.error(f"Error loading {file_path}: {e}")
+        return {}
+
+def save_json(file_path, data):
+    """Save JSON file with error handling and atomic writes."""
+    try:
+        # Write to temporary file first
+        temp_path = file_path.with_suffix('.tmp')
+        with open(temp_path, "w", encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        
+        # Atomic move
+        temp_path.replace(file_path)
+        return True
+    except IOError as e:
+        logger.error(f"Error saving {file_path}: {e}")
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        return False
+
+def compress_file(in_path, out_path):
+    """Compress file using gzip."""
+    try:
+        with open(in_path, 'rb') as f_in:
+            with gzip.open(out_path, 'wb', compresslevel=6) as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        return True
+    except Exception as e:
+        logger.error(f"Error compressing file: {e}")
+        return False
+
+def allowed_file(filename):
+    """Check if file extension is allowed."""
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
 def validate_username(username):
-    """Validate username format and length."""
-    if not username or len(username) < MIN_USERNAME_LENGTH or len(username) > MAX_USERNAME_LENGTH:
-        return False, f"Username must be {MIN_USERNAME_LENGTH}-{MAX_USERNAME_LENGTH} characters long"
-    
-    if not username.replace('_', '').replace('-', '').isalnum():
-        return False, "Username can only contain letters, numbers, hyphens, and underscores"
-    
-    return True, ""
+    """Validate username format."""
+    if not username or not isinstance(username, str):
+        return False
+    username = username.strip()
+    if len(username) < 3 or len(username) > 50:
+        return False
+    # Allow alphanumeric, underscore, hyphen
+    return username.replace('_', '').replace('-', '').isalnum()
+
+def find_user_case_insensitive(username, users_dict):
+    """Find user in dict with case-insensitive lookup."""
+    if not username:
+        return None
+    username_lower = username.lower()
+    for stored_username in users_dict.keys():
+        if stored_username.lower() == username_lower:
+            return stored_username
+    return None
 
 def token_required(f):
     """Decorator to require valid JWT token."""
@@ -106,67 +127,68 @@ def token_required(f):
         auth_header = request.headers.get('Authorization')
         
         if auth_header and auth_header.startswith('Bearer '):
-            token = auth_header.split(' ', 1)[1]
+            try:
+                token = auth_header.split(' ', 1)[1]
+            except IndexError:
+                return jsonify({'error': 'Invalid authorization header format'}), 401
         
         if not token:
             return jsonify({'error': 'Authentication token is missing'}), 401
         
         try:
             data = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-            kwargs['current_user'] = data['username']
+            username = data.get('username')
+            if not username:
+                return jsonify({'error': 'Invalid token payload'}), 401
+            kwargs['current_user'] = username
         except jwt.ExpiredSignatureError:
             return jsonify({'error': 'Token has expired'}), 401
         except jwt.InvalidTokenError as e:
-            logger.warning(f"Invalid token attempt: {str(e)}")
-            return jsonify({'error': 'Invalid token'}), 401
+            return jsonify({'error': f'Invalid token: {str(e)}'}), 401
         
         return f(*args, **kwargs)
     return decorated_function
 
-def cleanup_old_messages():
-    """Clean up old messages to maintain database performance."""
+def cleanup_expired_files():
+    """Clean up expired files."""
     try:
-        cutoff_date = datetime.now() - timedelta(days=MESSAGE_RETENTION_DAYS)
-        
-        with get_db_connection() as conn:
-            cursor = conn.execute(
-                "DELETE FROM messages WHERE created_at < ? AND is_read = 1",
-                (cutoff_date,)
-            )
-            deleted_count = cursor.rowcount
-            conn.commit()
+        with lock:
+            meta = load_json(META_FILE)
+            if not meta:
+                return
             
-        if deleted_count > 0:
-            logger.info(f"Cleaned up {deleted_count} old messages")
+            expired_files = []
+            current_time = time.time()
             
+            for file_id, info in meta.items():
+                if current_time - info.get("upload_time", 0) > FILE_EXPIRY_DAYS * 86400:
+                    expired_files.append(file_id)
+            
+            for file_id in expired_files:
+                info = meta.pop(file_id, {})
+                file_path = Path(info.get("path", ""))
+                if file_path.exists():
+                    try:
+                        file_path.unlink()
+                        logger.info(f"Deleted expired file: {file_id}")
+                    except Exception as e:
+                        logger.error(f"Error deleting expired file {file_id}: {e}")
+            
+            if expired_files:
+                save_json(META_FILE, meta)
+                logger.info(f"Cleaned up {len(expired_files)} expired files")
+                
     except Exception as e:
-        logger.error(f"Error during message cleanup: {e}")
-
-def get_user_stats():
-    """Get database statistics."""
-    try:
-        with get_db_connection() as conn:
-            users_count = conn.execute("SELECT COUNT(*) FROM users WHERE is_active = 1").fetchone()[0]
-            messages_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-            unread_count = conn.execute("SELECT COUNT(*) FROM messages WHERE is_read = 0").fetchone()[0]
-            
-        return {
-            'users': users_count,
-            'total_messages': messages_count,
-            'unread_messages': unread_count
-        }
-    except Exception as e:
-        logger.error(f"Error getting stats: {e}")
-        return {'users': 0, 'total_messages': 0, 'unread_messages': 0}
+        logger.error(f"Error during cleanup: {e}")
 
 # ===== ERROR HANDLERS =====
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({'error': 'File too large. Maximum size is 50MB.'}), 413
+
 @app.errorhandler(400)
 def bad_request(e):
     return jsonify({'error': 'Bad request'}), 400
-
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({'error': 'Not found'}), 404
 
 @app.errorhandler(500)
 def internal_error(e):
@@ -177,30 +199,36 @@ def internal_error(e):
 @app.route("/")
 def index():
     return jsonify({
-        "service": "PaL-HyperSecure Messaging Server",
+        "service": "PaL-HyperSecure Server",
         "status": "running",
-        "version": "2.0.0",
-        "features": ["secure messaging", "user authentication", "message encryption"]
+        "version": "1.0.1"
     })
 
 @app.route("/status")
 def status():
     """Get server status and statistics."""
     try:
-        stats = get_user_stats()
+        meta = load_json(META_FILE)
+        users = load_json(USER_FILE)
+        messages = load_json(MESSAGES_FILE)
         
-        # Trigger cleanup during status check
-        cleanup_old_messages()
+        # Clean up expired files during status check
+        cleanup_expired_files()
+        
+        # Count total messages
+        total_messages = 0
+        for user_msgs in messages.values():
+            if isinstance(user_msgs, list):
+                total_messages += len(user_msgs)
         
         return jsonify({
             "status": "online",
-            "users": stats['users'],
-            "total_messages": stats['total_messages'],
-            "unread_messages": stats['unread_messages'],
+            "files": len(meta),
+            "users": len(users),
+            "messages": total_messages,
             "uptime": time.time(),
-            "max_message_length": MAX_MESSAGE_LENGTH,
-            "message_retention_days": MESSAGE_RETENTION_DAYS,
-            "message": "Messaging server operational"
+            "max_file_size_mb": MAX_FILE_SIZE // (1024 * 1024),
+            "message": "Server is operational"
         })
     except Exception as e:
         logger.error(f"Error getting status: {e}")
@@ -218,39 +246,42 @@ def register():
         public_key = data.get("public_key", "").strip()
 
         # Validation
-        is_valid, error_msg = validate_username(username)
-        if not is_valid:
-            return jsonify({"error": error_msg}), 400
+        if not validate_username(username):
+            return jsonify({"error": "Username must be 3-50 characters and contain only letters, numbers, hyphens, and underscores"}), 400
         
-        if not public_key or len(public_key) < 100:
+        if not public_key or len(public_key) < 200:  # RSA public keys are longer
             return jsonify({"error": "Valid public key is required"}), 400
 
-        with get_db_connection() as conn:
-            # Check if username already exists (case-insensitive)
-            existing = conn.execute(
-                "SELECT username FROM users WHERE LOWER(username) = LOWER(?)",
-                (username,)
-            ).fetchone()
+        with lock:
+            users = load_json(USER_FILE)
             
-            if existing:
+            # Check if username already exists (case-insensitive)
+            if find_user_case_insensitive(username, users):
                 return jsonify({"error": "Username already exists"}), 409
             
-            # Insert new user
-            conn.execute(
-                "INSERT INTO users (username, public_key) VALUES (?, ?)",
-                (username, public_key)
-            )
-            conn.commit()
+            # Store user with original case
+            users[username] = {
+                "public_key": public_key,
+                "registered_at": time.time(),
+                "last_login": None
+            }
+            
+            if not save_json(USER_FILE, users):
+                return jsonify({"error": "Failed to save user data"}), 500
 
         # Generate JWT token
-        token = jwt.encode(
-            {
-                'username': username,
-                'exp': datetime.utcnow() + timedelta(hours=24)
-            },
-            SECRET_KEY,
-            algorithm="HS256"
-        )
+        try:
+            token = jwt.encode(
+                {
+                    'username': username,
+                    'exp': datetime.utcnow() + timedelta(hours=24)
+                },
+                SECRET_KEY,
+                algorithm="HS256"
+            )
+        except Exception as e:
+            logger.error(f"Error generating JWT token: {e}")
+            return jsonify({"error": "Failed to generate authentication token"}), 500
         
         logger.info(f"New user registered: {username}")
         return jsonify({
@@ -272,44 +303,51 @@ def login():
             return jsonify({"error": "Invalid JSON data"}), 400
         
         username = data.get("username", "").strip()
+        public_key = data.get("public_key", "").strip()
         
         if not username:
             return jsonify({"error": "Username is required"}), 400
+        
+        if not public_key:
+            return jsonify({"error": "Public key is required"}), 400
 
-        with get_db_connection() as conn:
-            # Case-insensitive username lookup
-            user = conn.execute(
-                "SELECT username FROM users WHERE LOWER(username) = LOWER(?) AND is_active = 1",
-                (username,)
-            ).fetchone()
+        with lock:
+            users = load_json(USER_FILE)
             
-            if not user:
+            # Find user (case-insensitive)
+            user_found = find_user_case_insensitive(username, users)
+            
+            if not user_found:
                 return jsonify({"error": "Username not found"}), 404
             
-            actual_username = user['username']
+            # Verify public key matches
+            stored_key = users[user_found].get("public_key", "")
+            if stored_key != public_key:
+                return jsonify({"error": "Invalid credentials"}), 401
             
             # Update last login
-            conn.execute(
-                "UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE username = ?",
-                (actual_username,)
-            )
-            conn.commit()
+            users[user_found]["last_login"] = time.time()
+            save_json(USER_FILE, users)
 
         # Generate JWT token
-        token = jwt.encode(
-            {
-                'username': actual_username,
-                'exp': datetime.utcnow() + timedelta(hours=24)
-            },
-            SECRET_KEY,
-            algorithm="HS256"
-        )
+        try:
+            token = jwt.encode(
+                {
+                    'username': user_found,
+                    'exp': datetime.utcnow() + timedelta(hours=24)
+                },
+                SECRET_KEY,
+                algorithm="HS256"
+            )
+        except Exception as e:
+            logger.error(f"Error generating JWT token: {e}")
+            return jsonify({"error": "Failed to generate authentication token"}), 500
         
-        logger.info(f"User logged in: {actual_username}")
+        logger.info(f"User logged in: {user_found}")
         return jsonify({
             "message": "Login successful",
             "token": token,
-            "username": actual_username
+            "username": user_found
         })
         
     except Exception as e:
@@ -331,37 +369,46 @@ def send_message(current_user):
         if not recipient or not content:
             return jsonify({"error": "Recipient and content are required"}), 400
         
-        if len(content) > MAX_MESSAGE_LENGTH:
-            return jsonify({"error": f"Message too long (max {MAX_MESSAGE_LENGTH} characters)"}), 400
+        if len(content) > 5000:
+            return jsonify({"error": "Message too long (max 5000 characters)"}), 400
 
-        # Prevent self-messaging
-        if recipient.lower() == current_user.lower():
-            return jsonify({"error": "Cannot send message to yourself"}), 400
+        # Check if recipient exists
+        users = load_json(USER_FILE)
+        recipient_found = find_user_case_insensitive(recipient, users)
+                
+        if not recipient_found:
+            return jsonify({"error": "Recipient not found"}), 404
 
-        with get_db_connection() as conn:
-            # Check if recipient exists (case-insensitive)
-            recipient_user = conn.execute(
-                "SELECT username FROM users WHERE LOWER(username) = LOWER(?) AND is_active = 1",
-                (recipient,)
-            ).fetchone()
-                
-            if not recipient_user:
-                return jsonify({"error": "Recipient not found"}), 404
-                
-            actual_recipient = recipient_user['username']
+        with lock:
+            messages = load_json(MESSAGES_FILE)
             
-            # Insert message
-            message_uuid = str(uuid.uuid4())
-            conn.execute(
-                "INSERT INTO messages (from_user, to_user, content, message_uuid) VALUES (?, ?, ?, ?)",
-                (current_user, actual_recipient, content, message_uuid)
-            )
-            conn.commit()
+            # Initialize recipient's inbox if it doesn't exist
+            if recipient_found not in messages:
+                messages[recipient_found] = []
+            
+            # Ensure it's a list
+            if not isinstance(messages[recipient_found], list):
+                messages[recipient_found] = []
+            
+            # Add message
+            message_id = str(uuid.uuid4())
+            new_message = {
+                "id": message_id,
+                "from": current_user,
+                "content": content,
+                "timestamp": time.time(),
+                "read": False
+            }
+            
+            messages[recipient_found].append(new_message)
+            
+            if not save_json(MESSAGES_FILE, messages):
+                return jsonify({"error": "Failed to save message"}), 500
 
-        logger.info(f"Message sent from {current_user} to {actual_recipient} (ID: {message_uuid})")
+        logger.info(f"Message sent from {current_user} to {recipient_found}")
         return jsonify({
             "message": "Message sent successfully",
-            "message_id": message_uuid
+            "message_id": message_id
         }), 201
         
     except Exception as e:
@@ -373,157 +420,255 @@ def send_message(current_user):
 def get_messages(username, current_user):
     """Get messages for current user."""
     try:
-        # Ensure user can only access their own messages
+        # Verify user can only access their own messages
         if username.lower() != current_user.lower():
             return jsonify({"error": "Unauthorized access"}), 403
         
-        with get_db_connection() as conn:
-            # Get unread messages
-            messages_cursor = conn.execute("""
-                SELECT from_user, content, created_at, message_uuid, is_read
-                FROM messages 
-                WHERE to_user = ? 
-                ORDER BY created_at DESC
-                LIMIT 50
-            """, (current_user,))
+        with lock:
+            messages = load_json(MESSAGES_FILE)
+            user_messages = messages.get(current_user, [])
             
-            messages = []
-            message_ids_to_mark_read = []
+            # Ensure it's a list
+            if not isinstance(user_messages, list):
+                user_messages = []
             
-            for row in messages_cursor:
-                message_data = {
-                    "id": row['message_uuid'],
-                    "from": row['from_user'],
-                    "content": row['content'],
-                    "timestamp": time.mktime(datetime.fromisoformat(row['created_at'].replace('Z', '+00:00')).timetuple()) if row['created_at'] else time.time(),
-                    "read": bool(row['is_read'])
-                }
-                messages.append(message_data)
-                
-                # Collect unread message IDs to mark as read
-                if not row['is_read']:
-                    message_ids_to_mark_read.append(row['message_uuid'])
-            
-            # Mark messages as read
-            if message_ids_to_mark_read:
-                placeholders = ','.join('?' * len(message_ids_to_mark_read))
-                conn.execute(
-                    f"UPDATE messages SET is_read = 1 WHERE message_uuid IN ({placeholders})",
-                    message_ids_to_mark_read
-                )
-                conn.commit()
+            # Sort messages by timestamp (newest first)
+            user_messages.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
 
-        logger.info(f"Messages retrieved by {current_user}: {len(messages)} messages, {len(message_ids_to_mark_read)} marked as read")
+        logger.info(f"Messages retrieved by {current_user}: {len(user_messages)} messages")
         return jsonify({
-            "messages": messages,
-            "total": len(messages),
-            "new_messages": len(message_ids_to_mark_read)
+            "messages": user_messages,
+            "total": len(user_messages),
+            "unread": len([m for m in user_messages if not m.get('read', False)])
         })
         
     except Exception as e:
         logger.error(f"Get messages error: {e}")
         return jsonify({"error": "Failed to retrieve messages"}), 500
 
-@app.route("/messages/<username>/unread", methods=["GET"])
+@app.route("/messages/<username>/mark-read", methods=["POST"])
 @token_required
-def get_unread_count(username, current_user):
-    """Get count of unread messages for user."""
+def mark_messages_read(username, current_user):
+    """Mark messages as read."""
     try:
+        # Verify user can only modify their own messages
         if username.lower() != current_user.lower():
             return jsonify({"error": "Unauthorized access"}), 403
         
-        with get_db_connection() as conn:
-            count = conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE to_user = ? AND is_read = 0",
-                (current_user,)
-            ).fetchone()[0]
-
-        return jsonify({"unread_count": count})
+        data = request.get_json() or {}
+        message_ids = data.get("message_ids", [])
         
-    except Exception as e:
-        logger.error(f"Get unread count error: {e}")
-        return jsonify({"error": "Failed to get unread count"}), 500
-
-@app.route("/users", methods=["GET"])
-@token_required
-def list_users(current_user):
-    """List active users (excluding current user)."""
-    try:
-        with get_db_connection() as conn:
-            users_cursor = conn.execute(
-                "SELECT username, created_at FROM users WHERE is_active = 1 AND username != ? ORDER BY username",
-                (current_user,)
-            )
+        with lock:
+            messages = load_json(MESSAGES_FILE)
+            user_messages = messages.get(current_user, [])
             
-            users = []
-            for row in users_cursor:
-                users.append({
-                    "username": row['username'],
-                    "joined": row['created_at']
-                })
+            if not isinstance(user_messages, list):
+                user_messages = []
+                messages[current_user] = user_messages
+            
+            marked_count = 0
+            
+            if message_ids:
+                # Mark specific messages
+                for message in user_messages:
+                    if message.get('id') in message_ids:
+                        message['read'] = True
+                        marked_count += 1
+            else:
+                # Mark all messages as read
+                for message in user_messages:
+                    if not message.get('read', False):
+                        message['read'] = True
+                        marked_count += 1
+            
+            if marked_count > 0:
+                messages[current_user] = user_messages
+                if not save_json(MESSAGES_FILE, messages):
+                    return jsonify({"error": "Failed to update messages"}), 500
 
-        return jsonify({"users": users, "total": len(users)})
-        
-    except Exception as e:
-        logger.error(f"List users error: {e}")
-        return jsonify({"error": "Failed to list users"}), 500
-
-@app.route("/health", methods=["GET"])
-def health_check():
-    """Health check endpoint."""
-    try:
-        # Test database connection
-        with get_db_connection() as conn:
-            conn.execute("SELECT 1").fetchone()
-        
+        logger.info(f"Messages marked as read by {current_user}: {marked_count} messages")
         return jsonify({
-            "status": "healthy",
-            "timestamp": datetime.utcnow().isoformat(),
-            "database": "connected"
+            "message": f"Marked {marked_count} messages as read",
+            "marked_count": marked_count
         })
+        
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
+        logger.error(f"Mark messages read error: {e}")
+        return jsonify({"error": "Failed to mark messages as read"}), 500
+
+@app.route("/upload", methods=["POST"])
+@token_required
+def upload(current_user):
+    """Upload a file."""
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+
+        file = request.files['file']
+        if not file or file.filename == '':
+            return jsonify({"error": "No file selected"}), 400
+
+        if not allowed_file(file.filename):
+            return jsonify({
+                "error": f"File type not allowed. Allowed types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+            }), 400
+
+        # Secure filename
+        original_filename = file.filename
+        filename = secure_filename(original_filename)
+        if not filename:
+            filename = f"upload_{int(time.time())}"
+
+        # Save uploaded file temporarily
+        file_id = str(uuid.uuid4())
+        temp_path = UPLOAD_FOLDER / f"temp_{file_id}"
+        
+        try:
+            file.save(temp_path)
+        except Exception as e:
+            logger.error(f"Error saving uploaded file: {e}")
+            return jsonify({"error": "Failed to save file"}), 500
+
+        # Get file size
+        file_size = temp_path.stat().st_size
+        if file_size > MAX_FILE_SIZE:
+            temp_path.unlink(missing_ok=True)
+            return jsonify({"error": f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB"}), 413
+
+        # Compress the file
+        compressed_path = UPLOAD_FOLDER / f"{file_id}.gz"
+        
+        if not compress_file(temp_path, compressed_path):
+            temp_path.unlink(missing_ok=True)
+            return jsonify({"error": "Failed to compress file"}), 500
+        
+        # Remove temp file
+        temp_path.unlink(missing_ok=True)
+
+        # Save metadata
+        with lock:
+            meta = load_json(META_FILE)
+            meta[file_id] = {
+                "original_name": original_filename,
+                "secure_name": filename,
+                "path": str(compressed_path),
+                "size": file_size,
+                "downloads": 0,
+                "upload_time": time.time(),
+                "uploader": current_user,
+                "mime_type": file.content_type or "application/octet-stream"
+            }
+            
+            if not save_json(META_FILE, meta):
+                compressed_path.unlink(missing_ok=True)
+                return jsonify({"error": "Failed to save metadata"}), 500
+        
+        logger.info(f"File uploaded by {current_user}: {original_filename} ({file_id})")
         return jsonify({
-            "status": "unhealthy",
-            "error": str(e)
-        }), 503
+            "message": "File uploaded successfully",
+            "file_id": file_id,
+            "original_name": original_filename,
+            "size": file_size
+        })
+        
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        return jsonify({"error": "Upload failed"}), 500
 
-# ===== BACKGROUND TASKS =====
-def run_scheduled_tasks():
-    """Run scheduled maintenance tasks."""
-    schedule.every(1).hours.do(cleanup_old_messages)
-    
-    while True:
-        schedule.run_pending()
-        time.sleep(300)  # Check every 5 minutes
+@app.route("/download/<file_id>", methods=["GET"])
+@token_required
+def download(file_id, current_user):
+    """Download a file."""
+    try:
+        # Validate file_id format (UUID)
+        try:
+            uuid.UUID(file_id)
+        except ValueError:
+            return jsonify({"error": "Invalid file ID format"}), 400
 
-# ===== INITIALIZATION =====
-def initialize_server():
-    """Initialize server components."""
-    logger.info("Initializing PaL-HyperSecure Messaging Server v2.0...")
-    
-    # Initialize database
-    init_database()
-    
-    # Start background task thread
-    bg_thread = Thread(target=run_scheduled_tasks, daemon=True)
-    bg_thread.start()
-    
-    # Initial cleanup
-    cleanup_old_messages()
-    
-    logger.info("Server initialization complete")
+        with lock:
+            meta = load_json(META_FILE)
+            if file_id not in meta:
+                return jsonify({"error": "File not found"}), 404
+
+            info = meta[file_id]
+            
+            # Check if file expired
+            if time.time() - info.get("upload_time", 0) > FILE_EXPIRY_DAYS * 86400:
+                return jsonify({"error": "File has expired"}), 410
+
+            # Check download limit
+            if info.get("downloads", 0) >= MAX_DOWNLOADS:
+                return jsonify({"error": "Download limit exceeded"}), 403
+
+            # Check if file still exists
+            file_path = Path(info["path"])
+            if not file_path.exists():
+                return jsonify({"error": "File no longer available"}), 410
+
+            # Update download count
+            info["downloads"] = info.get("downloads", 0) + 1
+            info["last_download"] = time.time()
+            info["last_downloader"] = current_user
+            meta[file_id] = info
+            save_json(META_FILE, meta)
+
+        logger.info(f"File downloaded by {current_user}: {file_id}")
+        
+        return send_file(
+            file_path,
+            as_attachment=True,
+            download_name=info.get("original_name", "download"),
+            mimetype=info.get("mime_type", "application/octet-stream")
+        )
+        
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        return jsonify({"error": "Download failed"}), 500
+
+@app.route("/files", methods=["GET"])
+@token_required
+def list_files(current_user):
+    """List files uploaded by current user."""
+    try:
+        meta = load_json(META_FILE)
+        user_files = []
+        
+        for file_id, info in meta.items():
+            if info.get("uploader") == current_user:
+                user_files.append({
+                    "file_id": file_id,
+                    "original_name": info.get("original_name"),
+                    "size": info.get("size"),
+                    "upload_time": info.get("upload_time"),
+                    "downloads": info.get("downloads", 0),
+                    "expires_at": info.get("upload_time", 0) + (FILE_EXPIRY_DAYS * 86400)
+                })
+        
+        # Sort by upload time (newest first)
+        user_files.sort(key=lambda x: x.get("upload_time", 0), reverse=True)
+        
+        return jsonify({
+            "files": user_files,
+            "total": len(user_files)
+        })
+        
+    except Exception as e:
+        logger.error(f"List files error: {e}")
+        return jsonify({"error": "Failed to list files"}), 500
 
 if __name__ == "__main__":
-    initialize_server()
+    logger.info("Starting PaL-HyperSecure Server...")
+    logger.info(f"Upload folder: {UPLOAD_FOLDER.absolute()}")
+    logger.info(f"Data folder: {DATA_FOLDER.absolute()}")
+    logger.info(f"Max file size: {MAX_FILE_SIZE // (1024*1024)}MB")
+    
+    # Run cleanup on startup
+    cleanup_expired_files()
     
     # Run the server
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("DEBUG", "False").lower() == "true"
-    
-    logger.info(f"Starting server on port {port}")
-    logger.info(f"Database: {DB_FILE.absolute()}")
-    logger.info(f"Debug mode: {debug}")
     
     app.run(
         host="0.0.0.0",
