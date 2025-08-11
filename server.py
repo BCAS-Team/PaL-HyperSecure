@@ -10,6 +10,7 @@ from sqlalchemy.orm import sessionmaker, relationship, Session
 from sqlalchemy.ext.declarative import declarative_base
 from passlib.context import CryptContext
 from jose import JWTError, jwt
+import psycopg2
 
 # Database Configuration for Railway
 # Use a default URL for local development if the environment variable isn't set.
@@ -61,8 +62,6 @@ class Friendship(Base):
     # Relationships to enable easy access to user and friend details
     user = relationship("User", foreign_keys=[user_id])
     friend = relationship("User", foreign_keys=[friend_id])
-
-Base.metadata.create_all(bind=engine)
 
 # Security and App Setup
 app = FastAPI()
@@ -224,6 +223,19 @@ def get_friends_list(current_user: User = Depends(get_current_user), db: Session
     accepted_friends = db.query(Friendship).filter(Friendship.user_id == current_user.id, Friendship.status == FriendshipStatus.ACCEPTED).all()
     friends_list = [{"id": f.friend.id, "username": f.friend.username} for f in accepted_friends]
     return friends_list
+    
+def create_db_and_tables():
+    try:
+        print("Attempting to connect to the database and create tables...")
+        Base.metadata.create_all(bind=engine)
+        print("Database tables created successfully.")
+    except psycopg2.OperationalError as e:
+        print("Failed to connect to the database!")
+        print("Please ensure the DATABASE_URL environment variable is set correctly.")
+        print(f"Error details: {e}")
+        # Re-raise the exception to stop the application startup if the DB isn't available
+        raise e
 
 if __name__ == "__main__":
+    create_db_and_tables()
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
