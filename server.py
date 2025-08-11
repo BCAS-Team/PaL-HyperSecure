@@ -53,9 +53,7 @@ class Friendship(Base):
     user_id = Column(Integer, ForeignKey("users.id"))
     friend_id = Column(Integer, ForeignKey("users.id"))
     
-    # FIX: The original code passed the Enum class to Column(Enum), which caused a TypeError.
-    # We must pass the string values directly to define the valid options.
-    # The 'name' argument is optional but good practice for clarity in the database.
+    # FIX: The Enum constructor requires a list of string literals.
     status = Column(Enum("pending", "accepted", name="friendship_status"), default="pending")
     
     created_at = Column(DateTime, default=datetime.utcnow)
