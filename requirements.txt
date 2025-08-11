@@ -1,0 +1,9 @@
+Flask==2.3.2
+PyJWT==2.8.0
+SQLAlchemy==1.4.48
+psycopg2-binary==2.9.10
+python-dotenv==1.0.0
+cryptography==41.0.3
+gunicorn==20.1.0
+requests==2.31.0
+werkzeug==2.3.7

@@ -1,0 +1,9 @@
+project = "pal-hypersecure"
+
+[deploy]
+  service = "web"
+
+[services.web]
+  name = "pal-hypersecure"
+  env = "production"
+  build = { path = "." }
