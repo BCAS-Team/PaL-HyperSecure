@@ -1,17 +1,6 @@
-# PaL-HyperSecure Messaging System Requirements
-
-# Core dependencies
-flask>=2.3.3
-requests>=2.31.0
-cryptography>=41.0.0
-PyJWT>=2.8.0
-
-# Rich UI for client (optional but recommended)
-rich>=13.0.0
-
-# Server-specific
-schedule>=1.2.0
-
-# Development/Testing (optional)
-pytest>=7.4.0
-black>=23.0.0
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+passlib
+python-jose[cryptography]
